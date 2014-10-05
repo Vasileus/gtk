@@ -16,12 +16,15 @@
  * License along with this library. If not, see <http://www.gnu.org/licenses/>.
  */
 #include <gtk/gtk.h>
+#include <string.h>
 
 typedef struct {
+  GtkWidget *sw;
   GtkWidget *rv;
   gint64 last_scroll_time;
   gboolean over;
   gboolean dragging;
+  gboolean enabled;
 } IndicatorData;
 
 IndicatorData *
@@ -47,6 +50,7 @@ conceil_scrollbar (gpointer data)
   IndicatorData *id = get_indicator_data (sb);
 
   if (g_get_monotonic_time () - id->last_scroll_time >= 1000000 &&
+      id->enabled &&
       !id->over &&
       !id->dragging)
     {
@@ -62,7 +66,8 @@ value_changed (GtkAdjustment *adj, GtkWidget *sb)
 {
   IndicatorData *id = get_indicator_data (sb);
 
-  if (!gtk_revealer_get_reveal_child (GTK_REVEALER (id->rv)))
+  if (id->enabled &&
+      !gtk_revealer_get_reveal_child (GTK_REVEALER (id->rv)))
     gtk_revealer_set_reveal_child (GTK_REVEALER (id->rv), TRUE);
 
   id->last_scroll_time = g_get_monotonic_time ();  
@@ -105,6 +110,114 @@ style_changed (GtkStyleContext *context, GtkWidget *sb)
     id->dragging = FALSE;
 }
 
+static const gchar *
+input_source (GdkInputSource source)
+{
+  switch (source)
+    {
+    case GDK_SOURCE_MOUSE: return "mouse";
+    case GDK_SOURCE_PEN: return "pen";
+    case GDK_SOURCE_ERASER: return "eraser";
+    case GDK_SOURCE_CURSOR: return "cursor";
+    case GDK_SOURCE_KEYBOARD: return "keyboard";
+    case GDK_SOURCE_TOUCHSCREEN: return "touchscreen";
+    case GDK_SOURCE_TOUCHPAD: return "touchpad";
+    default: return "unknown";
+    }
+}
+
+static void
+list_devices (GdkDeviceManager *dm)
+{
+  GList *devices, *l;
+  GList *slaves, *s;
+  GdkDevice *device;
+
+  devices = gdk_device_manager_list_devices (dm, GDK_DEVICE_TYPE_MASTER);
+  for (l = devices; l; l = l->next)
+    {
+      device = l->data;
+      g_print ("%s%s\n",
+               gdk_device_get_name (device),
+               gdk_device_get_has_cursor (device) ? ", has cursor" : "");
+      slaves = gdk_device_list_slave_devices (device);
+      for (s = slaves; s; s = s->next)
+        {
+          device = s->data;
+          g_print ("  ↳ %s, %s\n",
+                   gdk_device_get_name (device),
+                   input_source (gdk_device_get_source (device)));
+        }
+      g_list_free (slaves);
+    }
+  g_list_free (devices);
+}
+
+static gboolean
+has_mouse (GdkDeviceManager *dm)
+{
+  GdkDevice *cp;
+  GList *slaves, *s;
+  GdkDevice *device;
+  gboolean found;
+
+  found = FALSE;
+
+  cp = gdk_device_manager_get_client_pointer (dm);
+  slaves = gdk_device_list_slave_devices (cp);
+  for (s = slaves; s; s = s->next)
+    {
+      device = s->data;
+
+      if (gdk_device_get_source (device) != GDK_SOURCE_MOUSE)
+        continue;
+
+      if (strstr (gdk_device_get_name (device), "XTEST"))
+        continue;
+
+      if (strstr (gdk_device_get_name (device), "TrackPoint"))
+        continue;
+
+      if (g_object_get_data (G_OBJECT (device), "removed"))
+        continue;
+
+      found = TRUE;
+      break;
+    }
+  g_list_free (slaves);
+
+  return found;
+}
+
+static void
+update_mouse_mode (GdkDeviceManager *dm, GtkWidget *sb)
+{
+  IndicatorData *id = get_indicator_data (sb);
+
+  id->enabled = !has_mouse (dm);
+  gtk_scrolled_window_set_policy (GTK_SCROLLED_WINDOW (id->sw),
+                                  GTK_POLICY_NEVER,
+                                  id->enabled ? GTK_POLICY_EXTERNAL : GTK_POLICY_AUTOMATIC);
+
+  g_print ("touch mode now %s\n", id->enabled ? "ON" : "OFF");
+}
+
+static void
+device_added (GdkDeviceManager *dm, GdkDevice *device, GtkWidget *sb)
+{
+  update_mouse_mode (dm, sb);
+}
+
+static void
+device_removed (GdkDeviceManager *dm, GdkDevice *device, GtkWidget *sb)
+{
+  /* We need to work around the fact that ::device-removed is emitted
+   * before the device is removed from the list.
+   */
+  g_object_set_data (G_OBJECT (device), "removed", GINT_TO_POINTER (1));
+  update_mouse_mode (dm, sb);
+}
+
 static gchar *
 get_content (void)
 {
@@ -143,11 +256,12 @@ main (int argc, char *argv[])
   GtkWidget *sw;
   GtkWidget *tv;
   GtkWidget *ov;
-  GtkWidget *sb;
   GtkWidget *rv;
+  GtkWidget *sb;
   GtkAdjustment *adj;
   GtkCssProvider *provider;
   IndicatorData *id;
+  GdkDeviceManager *dm;
 
   gtk_init (&argc, &argv);
 
@@ -195,6 +309,7 @@ main (int argc, char *argv[])
   gtk_widget_set_valign (rv, GTK_ALIGN_FILL);
 
   id = get_indicator_data (sb);
+  id->sw = sw;
   id->rv = rv;
 
   gtk_style_context_add_class (gtk_widget_get_style_context (sb), "overlay-indicator");
@@ -204,12 +319,20 @@ main (int argc, char *argv[])
   g_signal_connect (adj, "value-changed", G_CALLBACK (value_changed), sb);
   g_timeout_add (500, conceil_scrollbar, sb);
 
-#if 1
-  sb = gtk_scrollbar_new (GTK_ORIENTATION_VERTICAL, adj);
-  gtk_container_add (GTK_CONTAINER (box), sb);
+#if 0
+  GtkWidget *sb2;
+  sb2 = gtk_scrollbar_new (GTK_ORIENTATION_VERTICAL, adj);
+  gtk_container_add (GTK_CONTAINER (box), sb2);
 #endif
 
   gtk_widget_show_all (window);
+
+  dm = gdk_display_get_device_manager (gdk_display_get_default ());
+  list_devices (dm);
+
+  g_signal_connect (dm, "device-added", G_CALLBACK (device_added), sb);
+  g_signal_connect (dm, "device-removed", G_CALLBACK (device_removed), sb);
+  update_mouse_mode (dm, sb);
 
   gtk_main ();
 
